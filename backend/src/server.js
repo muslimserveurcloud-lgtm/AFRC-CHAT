@@ -1,0 +1,50 @@
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import multer from 'multer';
+import fs from 'fs';
+import path from 'path';
+import { createServer } from 'http';
+import { Server } from 'socket.io';
+import { randomUUID } from 'crypto';
+
+const app = express();
+const httpServer = createServer(app);
+const io = new Server(httpServer, { cors: { origin: process.env.CORS_ORIGIN || '*' } });
+const PORT = Number(process.env.PORT || 10000);
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
+const uploadDir = path.resolve(process.env.UPLOAD_DIR || './uploads');
+fs.mkdirSync(uploadDir, { recursive: true });
+const dbFile = path.join(uploadDir, 'afrc-data.json');
+const db = fs.existsSync(dbFile) ? JSON.parse(fs.readFileSync(dbFile, 'utf8')) : { users: [], chats: [], messages: [], stories: [], blocks: [], reports: [] };
+const save = () => fs.writeFileSync(dbFile, JSON.stringify(db, null, 2));
+app.use(cors()); app.use(express.json({ limit: '2mb' })); app.use('/uploads', express.static(uploadDir));
+const upload = multer({ dest: uploadDir, limits: { fileSize: 200 * 1024 * 1024 } });
+const tokenFor = u => jwt.sign({ id: u.id, email: u.email }, JWT_SECRET, { expiresIn: '30d' });
+const auth = (req, res, next) => { try { req.user = jwt.verify((req.headers.authorization || '').replace(/^Bearer /, ''), JWT_SECRET); next(); } catch { res.status(401).json({ error: 'Non authentifié' }); } };
+
+app.get('/api/health', (_, res) => res.json({ ok: true, service: 'AFRC CHAT', version: '2.0.0', calls: false }));
+app.post('/api/auth/register', async (req,res) => { const { username, email, password, fullName='' } = req.body; if (!username || !email || !password) return res.status(400).json({ error:'Champs requis' }); if (db.users.some(u=>u.email===email.toLowerCase())) return res.status(409).json({error:'Email déjà utilisé'}); const u={id:randomUUID(),username,email:email.toLowerCase(),fullName,passwordHash:await bcrypt.hash(password,12),createdAt:new Date().toISOString(),lastSeen:new Date().toISOString(),online:false}; db.users.push(u); save(); res.json({ token:tokenFor(u), user:{id:u.id,username:u.username,email:u.email,fullName:u.fullName} }); });
+app.post('/api/auth/login', async (req,res) => { const {email,password}=req.body; const u=db.users.find(x=>x.email===String(email||'').toLowerCase()); if(!u || !(await bcrypt.compare(password||'',u.passwordHash))) return res.status(401).json({error:'Identifiants invalides'}); u.online=true; u.lastSeen=new Date().toISOString(); save(); res.json({token:tokenFor(u),user:{id:u.id,username:u.username,email:u.email,fullName:u.fullName}}); });
+app.post('/api/auth/logout', auth, (req,res)=>{const u=db.users.find(x=>x.id===req.user.id);if(u){u.online=false;u.lastSeen=new Date().toISOString();save()}res.json({ok:true})});
+app.get('/api/me', auth, (req,res)=>{const u=db.users.find(x=>x.id===req.user.id); if(!u)return res.status(404).end(); res.json({id:u.id,username:u.username,email:u.email,fullName:u.fullName,online:u.online,lastSeen:u.lastSeen});});
+app.get('/api/users/search', auth, (req,res)=>{const q=String(req.query.q||'').toLowerCase();res.json(db.users.filter(u=>u.id!==req.user.id && (`${u.username} ${u.fullName} ${u.email}`).toLowerCase().includes(q)).slice(0,30).map(u=>({id:u.id,username:u.username,fullName:u.fullName,online:u.online,lastSeen:u.lastSeen})))});
+app.post('/api/chats', auth, (req,res)=>{const {userId,name,type='private',members=[]}=req.body;const list=type==='private'?[req.user.id,userId]:[req.user.id,...members];const chat={id:randomUUID(),type,name:name||'',members:[...new Set(list)].filter(Boolean),createdAt:new Date().toISOString()};db.chats.push(chat);save();res.json(chat)});
+app.get('/api/chats',auth,(req,res)=>res.json(db.chats.filter(c=>c.members.includes(req.user.id))));
+app.get('/api/chats/:id/messages',auth,(req,res)=>res.json(db.messages.filter(m=>m.chatId===req.params.id).slice(-100)));
+app.post('/api/chats/:id/messages',auth,(req,res)=>{const chat=db.chats.find(c=>c.id===req.params.id&&c.members.includes(req.user.id));if(!chat)return res.status(404).json({error:'Discussion introuvable'});const m={id:randomUUID(),chatId:chat.id,senderId:req.user.id,text:String(req.body.text||''),type:req.body.type||'text',mediaUrl:req.body.mediaUrl||null,status:'sent',reactions:{},replyTo:req.body.replyTo||null,edited:false,createdAt:new Date().toISOString()};db.messages.push(m);save();io.to(`chat:${chat.id}`).emit('message:new',m);res.json(m)});
+app.patch('/api/messages/:id',auth,(req,res)=>{const m=db.messages.find(x=>x.id===req.params.id&&x.senderId===req.user.id);if(!m)return res.status(404).end();m.text=String(req.body.text??m.text);m.edited=true;save();io.to(`chat:${m.chatId}`).emit('message:updated',m);res.json(m)});
+app.delete('/api/messages/:id',auth,(req,res)=>{const i=db.messages.findIndex(x=>x.id===req.params.id&&x.senderId===req.user.id);if(i<0)return res.status(404).end();const [m]=db.messages.splice(i,1);save();io.to(`chat:${m.chatId}`).emit('message:deleted',{id:m.id,chatId:m.chatId});res.json({ok:true})});
+app.post('/api/messages/:id/reactions',auth,(req,res)=>{const m=db.messages.find(x=>x.id===req.params.id);if(!m)return res.status(404).end();m.reactions[m.reactions?'user:'+req.user.id:req.user.id]=String(req.body.reaction||'❤️');save();io.to(`chat:${m.chatId}`).emit('message:reaction',m);res.json(m)});
+app.post('/api/upload',auth,upload.single('file'),(req,res)=>{if(!req.file)return res.status(400).json({error:'Fichier manquant'});const ext=path.extname(req.file.originalname);const final=`${req.file.filename}${ext}`;fs.renameSync(req.file.path,path.join(uploadDir,final));res.json({url:`/uploads/${final}`,name:req.file.originalname,size:req.file.size,mime:req.file.mimetype})});
+app.post('/api/stories',auth,(req,res)=>{const s={id:randomUUID(),userId:req.user.id,mediaUrl:req.body.mediaUrl,text:req.body.text||'',createdAt:new Date().toISOString(),expiresAt:new Date(Date.now()+86400000).toISOString(),views:[]};db.stories.push(s);save();io.emit('story:new',s);res.json(s)});
+app.get('/api/stories',auth,(_,res)=>{const now=Date.now();res.json(db.stories.filter(s=>Date.parse(s.expiresAt)>now))});
+app.post('/api/block/:userId',auth,(req,res)=>{db.blocks.push({id:randomUUID(),userId:req.user.id,blockedUserId:req.params.userId});save();res.json({ok:true})});
+app.post('/api/reports',auth,(req,res)=>{db.reports.push({id:randomUUID(),reporterId:req.user.id,targetUserId:req.body.targetUserId||null,messageId:req.body.messageId||null,reason:req.body.reason||'',createdAt:new Date().toISOString()});save();res.json({ok:true})});
+
+io.use((socket,next)=>{try{const token=String(socket.handshake.query.token||'');socket.user=jwt.verify(token,JWT_SECRET);next()}catch{next(new Error('unauthorized'))}});
+io.on('connection',socket=>{const uid=socket.user.id;const u=db.users.find(x=>x.id===uid);if(u){u.online=true;u.lastSeen=new Date().toISOString();save()}socket.on('chat:join',chatId=>socket.join(`chat:${chatId}`));socket.on('chat:leave',chatId=>socket.leave(`chat:${chatId}`));socket.on('message:send',async p=>{const chat=db.chats.find(c=>c.id===p.conversationId&&c.members.includes(uid));if(!chat)return;const m={id:randomUUID(),chatId:chat.id,senderId:uid,text:String(p.text||''),type:'text',status:'sent',reactions:{},replyTo:p.replyTo||null,edited:false,createdAt:new Date().toISOString()};db.messages.push(m);save();io.to(`chat:${chat.id}`).emit('message:new',m)});socket.on('message:read',p=>{const m=db.messages.find(x=>x.id===p.messageId);if(m){m.status='read';save();io.to(`chat:${m.chatId}`).emit('message:status',{id:m.id,status:'read'})}});socket.on('disconnect',()=>{const x=db.users.find(a=>a.id===uid);if(x){x.online=false;x.lastSeen=new Date().toISOString();save();io.emit('presence:update',{userId:uid,online:false,lastSeen:x.lastSeen})}})});
+
+httpServer.listen(PORT,()=>console.log(`AFRC CHAT backend listening on ${PORT}`));
